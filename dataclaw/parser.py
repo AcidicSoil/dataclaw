@@ -1214,6 +1214,34 @@ def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anon
 
         if pt == "function_call_output":
             raw = p.get("output", "")
+
+            # Codex output can be a string, dict, or list of structured items.
+            if isinstance(raw, list):
+                chunks: list[str] = []
+                for item in raw:
+                    if isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            chunks.append(text)
+                            continue
+                        content = item.get("content")
+                        if isinstance(content, str) and content.strip():
+                            chunks.append(content)
+                            continue
+                    elif isinstance(item, str) and item.strip():
+                        chunks.append(item)
+                raw = "\n".join(chunks).strip()
+            elif isinstance(raw, dict):
+                text = raw.get("text")
+                if isinstance(text, str) and text.strip():
+                    raw = text
+                else:
+                    raw = json.dumps(raw)
+            elif raw is None:
+                raw = ""
+            elif not isinstance(raw, str):
+                raw = str(raw)
+
             # Parse "Exit code: N\nWall time: ...\nOutput:\n..." format
             out: dict = {}
             lines = raw.splitlines()
@@ -1233,24 +1261,27 @@ def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anon
                     output_lines.append(line)
             if output_lines:
                 out["output"] = anonymizer.text("\n".join(output_lines).strip())
+            elif isinstance(raw, str) and raw.strip():
+                out["output"] = anonymizer.text(raw.strip())
             result[call_id] = {"output": out, "status": "success"}
 
         elif pt == "custom_tool_call_output":
             raw = p.get("output", "")
             out = {}
             try:
-                parsed = json.loads(raw)
-                text = parsed.get("output", "")
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                text = parsed.get("output", "") if isinstance(parsed, dict) else ""
                 if text:
                     out["output"] = anonymizer.text(str(text))
-                meta = parsed.get("metadata", {})
-                if "exit_code" in meta:
-                    out["exit_code"] = meta["exit_code"]
-                if "duration_seconds" in meta:
-                    out["duration_seconds"] = meta["duration_seconds"]
-            except (json.JSONDecodeError, AttributeError):
+                meta = parsed.get("metadata", {}) if isinstance(parsed, dict) else {}
+                if isinstance(meta, dict):
+                    if "exit_code" in meta:
+                        out["exit_code"] = meta["exit_code"]
+                    if "duration_seconds" in meta:
+                        out["duration_seconds"] = meta["duration_seconds"]
+            except (json.JSONDecodeError, AttributeError, TypeError):
                 if raw:
-                    out["output"] = anonymizer.text(raw)
+                    out["output"] = anonymizer.text(str(raw))
             result[call_id] = {"output": out, "status": "success"}
 
     return result
