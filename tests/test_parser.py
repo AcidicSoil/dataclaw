@@ -438,6 +438,7 @@ class TestDiscoverProjects:
         monkeypatch.setattr("dataclaw.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
         monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
         monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
         monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", tmp_path / "no-custom")
 
     def _write_opencode_db(self, db_path):
@@ -990,6 +991,7 @@ class TestDiscoverSubagentProjects:
         monkeypatch.setattr("dataclaw.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
         monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
         monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
         monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", tmp_path / "no-custom")
 
     def test_discover_includes_subagent_sessions(self, tmp_path, monkeypatch, mock_anonymizer):
@@ -1590,6 +1592,7 @@ class TestDiscoverOpenclawProjects:
         monkeypatch.setattr("dataclaw.parser._OPENCODE_PROJECT_INDEX", {})
         monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
         monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
         monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", tmp_path / "no-custom")
 
     def test_discover_openclaw_projects(self, tmp_path, monkeypatch, mock_anonymizer):
@@ -1665,6 +1668,159 @@ class TestDiscoverOpenclawProjects:
         assert projects[0]["session_count"] == 2
 
 
+def _create_hermes_db(db_path, sessions, messages):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO sessions (
+                id, source, model, started_at, ended_at, tool_call_count, input_tokens, output_tokens, title
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sessions,
+        )
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp, reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            messages,
+        )
+        conn.commit()
+
+
+class TestDiscoverHermesProjects:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("dataclaw.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("dataclaw.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("dataclaw.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("dataclaw.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("dataclaw.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("dataclaw.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
+        monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", tmp_path / "no-custom")
+
+    def test_discover_hermes_projects(self, tmp_path, monkeypatch):
+        self._disable_others(tmp_path, monkeypatch)
+        db_path = tmp_path / "state.db"
+        _create_hermes_db(
+            db_path,
+            sessions=[
+                ("sess-cli-1", "cli", "gpt-4.1", 1710000000.0, 1710000060.0, 1, 100, 40, "CLI Session"),
+                ("sess-cli-2", "cli", "gpt-4.1", 1710000100.0, 1710000160.0, 0, 20, 10, "CLI Session 2"),
+                ("sess-discord-1", "discord", "claude", 1710000200.0, 1710000260.0, 0, 30, 15, "Discord Session"),
+            ],
+            messages=[],
+        )
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", db_path)
+
+        projects = discover_projects()
+        assert len(projects) == 2
+        assert [p["display_name"] for p in projects] == ["hermes:cli", "hermes:discord"]
+        assert [p["session_count"] for p in projects] == [2, 1]
+        assert all(p["source"] == "hermes" for p in projects)
+
+    def test_parse_hermes_project_sessions(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        db_path = tmp_path / "state.db"
+        tool_calls = json.dumps([
+            {"id": "call-1", "name": "bash", "arguments": {"command": "pwd"}},
+        ])
+        _create_hermes_db(
+            db_path,
+            sessions=[
+                ("sess-cli-1", "cli", "gpt-4.1", 1710000000.0, 1710000060.0, 1, 100, 40, "CLI Session"),
+                ("sess-discord-1", "discord", "claude", 1710000200.0, 1710000260.0, 0, 30, 15, "Discord Session"),
+            ],
+            messages=[
+                ("sess-cli-1", "user", "Check /tmp/project", None, None, None, 1710000001.0, None),
+                ("sess-cli-1", "assistant", "Running a command", None, tool_calls, None, 1710000002.0, "Thinking step"),
+                ("sess-cli-1", "tool", "command output", "call-1", None, "bash", 1710000003.0, None),
+                ("sess-discord-1", "user", "Ignore me", None, None, None, 1710000201.0, None),
+            ],
+        )
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", db_path)
+
+        sessions = parse_project_sessions("cli", mock_anonymizer, source="hermes")
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session["source"] == "hermes"
+        assert session["project"] == "hermes:cli"
+        assert session["session_id"] == "sess-cli-1"
+        assert session["model"] == "gpt-4.1"
+        assert session["stats"]["input_tokens"] == 100
+        assert session["stats"]["output_tokens"] == 40
+        assert session["messages"][0]["role"] == "user"
+        assert "project" in session["messages"][0]["content"]
+        assistant_msgs = [m for m in session["messages"] if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 2
+        assert assistant_msgs[0]["thinking"] == "Thinking step"
+        assert assistant_msgs[0]["tool_uses"][0]["tool"] == "bash"
+        assert assistant_msgs[0]["tool_uses"][0]["input"]["command"] == "pwd"
+        assert assistant_msgs[1]["tool_uses"][0]["output"]["text"] == "command output"
+
+    def test_parse_hermes_skips_missing_db(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "missing.db")
+        sessions = parse_project_sessions("cli", mock_anonymizer, source="hermes")
+        assert sessions == []
+
+
 class TestDiscoverCustomProjects:
     def _disable_others(self, tmp_path, monkeypatch):
         monkeypatch.setattr("dataclaw.parser.PROJECTS_DIR", tmp_path / "no-claude")
@@ -1677,6 +1833,7 @@ class TestDiscoverCustomProjects:
         monkeypatch.setattr("dataclaw.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
         monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
         monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
 
     def _make_valid_session(self, session_id="s1", model="gpt-4", content="hello"):
         return json.dumps({

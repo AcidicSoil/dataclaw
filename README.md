@@ -2,7 +2,7 @@
 
 > **This is a performance art project.** Anthropic built their models on the world's freely shared information, then introduced increasingly [dystopian data policies](https://www.anthropic.com/news/detecting-and-preventing-distillation-attacks) to stop anyone else from doing the same with their data — pulling up the ladder behind them. DataClaw lets you throw the ladder back down. The dataset it produces is yours to share.
 
-Turn your Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw conversation history into structured data and publish it to Hugging Face with a single command. DataClaw parses session logs, redacts secrets and PII, and uploads the result as a ready-to-use dataset.
+Turn your Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, and Hermes conversation history into structured data and publish it to Hugging Face with a single command. DataClaw parses session logs, redacts secrets and PII, and uploads the result as a ready-to-use dataset.
 
 ![DataClaw](dataclaw.jpeg)
 
@@ -13,7 +13,7 @@ Every export is tagged **`dataclaw`** on Hugging Face. Together, they may someda
 Paste this into Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, or any coding agent:
 
 ```
-Help me export my Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw conversation history to Hugging Face using DataClaw.
+Help me export my Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, and Hermes conversation history to Hugging Face using DataClaw.
 Install it, set up the skill, then walk me through the process.
 
 STEP 1 — INSTALL
@@ -29,12 +29,12 @@ STEP 3 — START
   Every dataclaw command outputs next_steps in its JSON — follow them through the entire flow.
 
 STEP 3A — CHOOSE SOURCE SCOPE (REQUIRED BEFORE EXPORT)
-  Ask the user explicitly: Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, or all?
-  dataclaw config --source "claude|codex|gemini|opencode|openclaw|all"
+  Ask the user explicitly: Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Hermes, or all?
+  dataclaw config --source "claude|codex|gemini|opencode|openclaw|hermes|all"
   Do not export until source scope is explicitly confirmed.
 
 STEP 3B — PRESENT ALL FOLDERS (REQUIRED BEFORE EXPORT)
-  dataclaw list --source "claude|codex|gemini|opencode|openclaw|all"
+  dataclaw list --source "claude|codex|gemini|opencode|openclaw|hermes|all"
   Send the FULL project/folder list to the user in a message (name, source, sessions, size, excluded).
   Ask which projects to exclude.
   dataclaw config --exclude "project1,project2" OR dataclaw config --confirm-projects
@@ -69,7 +69,7 @@ huggingface-cli login --token YOUR_TOKEN
 
 # See your projects
 dataclaw prep
-dataclaw config --source all  # REQUIRED: choose claude, codex, gemini, opencode, openclaw, or all
+dataclaw config --source all  # REQUIRED: choose claude, codex, gemini, opencode, openclaw, hermes, or all
 dataclaw list --source all  # Present full list and confirm folder scope before export
 
 # Configure
@@ -111,12 +111,13 @@ dataclaw export --publish-attestation "User explicitly approved publishing to Hu
 | `dataclaw prep --source gemini` | Prep using only Gemini CLI sessions |
 | `dataclaw prep --source opencode` | Prep using only OpenCode sessions |
 | `dataclaw prep --source openclaw` | Prep using only OpenClaw sessions |
+| `dataclaw prep --source hermes` | Prep using only Hermes sessions |
 | `dataclaw list` | List all projects with exclusion status |
 | `dataclaw list --source all` | List all sources |
 | `dataclaw list --source codex` | List only Codex projects |
 | `dataclaw config` | Show current config |
 | `dataclaw config --repo user/my-personal-codex-data` | Set HF repo |
-| `dataclaw config --source all` | REQUIRED source scope selection (`claude`, `codex`, `gemini`, `opencode`, `openclaw`, or `all`) |
+| `dataclaw config --source all` | REQUIRED source scope selection (`claude`, `codex`, `gemini`, `opencode`, `openclaw`, `hermes`, or `all`) |
 | `dataclaw config --exclude "a,b"` | Add excluded projects (appends) |
 | `dataclaw config --redact "str1,str2"` | Add strings to always redact (appends) |
 | `dataclaw config --redact-usernames "u1,u2"` | Add usernames to anonymize (appends) |
@@ -128,6 +129,7 @@ dataclaw export --publish-attestation "User explicitly approved publishing to Hu
 | `dataclaw export --source gemini --no-push` | Export only Gemini CLI sessions locally |
 | `dataclaw export --source opencode --no-push` | Export only OpenCode sessions locally |
 | `dataclaw export --source openclaw --no-push` | Export only OpenClaw sessions locally |
+| `dataclaw export --source hermes --no-push` | Export only Hermes sessions locally |
 | `dataclaw confirm --full-name "NAME" --attest-full-name "..." --attest-sensitive "..." --attest-manual-scan "..."` | Scan for PII, run exact-name privacy check, verify review attestations, unlock pushing |
 | `dataclaw confirm --skip-full-name-scan --attest-full-name "..." --attest-sensitive "..." --attest-manual-scan "..."` | Skip exact-name scan when user declines sharing full name (requires skip attestation) |
 | `dataclaw export --publish-attestation "..."` | Export and push (requires `dataclaw confirm` first) |

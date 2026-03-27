@@ -20,6 +20,7 @@ GEMINI_SOURCE = "gemini"
 OPENCODE_SOURCE = "opencode"
 OPENCLAW_SOURCE = "openclaw"
 KIMI_SOURCE = "kimi"
+HERMES_SOURCE = "hermes"
 CUSTOM_SOURCE = "custom"
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -44,6 +45,9 @@ KIMI_DIR = Path.home() / ".kimi"
 KIMI_SESSIONS_DIR = KIMI_DIR / "sessions"
 KIMI_CONFIG_PATH = KIMI_DIR / "kimi.json"
 UNKNOWN_KIMI_CWD = "<unknown-cwd>"
+
+HERMES_DIR = Path.home() / ".hermes"
+HERMES_DB_PATH = HERMES_DIR / "state.db"
 
 CUSTOM_DIR = Path.home() / ".dataclaw" / "custom"
 
@@ -140,6 +144,7 @@ def discover_projects() -> list[dict]:
     projects.extend(_discover_opencode_projects())
     projects.extend(_discover_openclaw_projects())
     projects.extend(_discover_kimi_projects())
+    projects.extend(_discover_hermes_projects())
     projects.extend(_discover_custom_projects())
     return sorted(projects, key=lambda p: (p["display_name"], p["source"]))
 
@@ -334,6 +339,43 @@ def _build_kimi_project_name(cwd: str) -> str:
     return f"kimi:{Path(cwd).name or cwd}"
 
 
+def _build_hermes_project_name(source_name: str) -> str:
+    return f"hermes:{source_name or 'unknown'}"
+
+
+def _discover_hermes_projects() -> list[dict]:
+    if not HERMES_DB_PATH.exists():
+        return []
+
+    projects = []
+    db_size = HERMES_DB_PATH.stat().st_size if HERMES_DB_PATH.exists() else 0
+    try:
+        with sqlite3.connect(HERMES_DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT source, COUNT(*) AS session_count FROM sessions GROUP BY source ORDER BY source"
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+
+    total_sessions = sum(int(row[1]) for row in rows)
+    for source_name, session_count in rows:
+        normalized_source = source_name if isinstance(source_name, str) and source_name.strip() else "unknown"
+        count = int(session_count)
+        if count <= 0:
+            continue
+        estimated_size = int(db_size * (count / total_sessions)) if total_sessions else 0
+        projects.append(
+            {
+                "dir_name": normalized_source,
+                "display_name": _build_hermes_project_name(normalized_source),
+                "session_count": count,
+                "total_size_bytes": estimated_size,
+                "source": HERMES_SOURCE,
+            }
+        )
+    return projects
+
+
 def _discover_custom_projects() -> list[dict]:
     if not CUSTOM_DIR.exists():
         return []
@@ -365,6 +407,152 @@ def _discover_custom_projects() -> list[dict]:
             }
         )
     return projects
+
+
+def _parse_hermes_message(
+    row: sqlite3.Row,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> dict[str, Any] | None:
+    role = row["role"]
+    content = row["content"]
+    timestamp = _normalize_unix_timestamp(row["timestamp"])
+    text_content = anonymizer.text(content) if isinstance(content, str) and content.strip() else None
+
+    if role == "user":
+        if text_content is None:
+            return None
+        return {"role": "user", "content": text_content, "timestamp": timestamp}
+
+    if role == "assistant":
+        msg: dict[str, Any] = {"role": "assistant", "timestamp": timestamp}
+        if text_content is not None:
+            msg["content"] = text_content
+        if include_thinking:
+            reasoning = row["reasoning"]
+            if isinstance(reasoning, str) and reasoning.strip():
+                msg["thinking"] = anonymizer.text(reasoning)
+
+        tool_calls = row["tool_calls"]
+        if isinstance(tool_calls, str) and tool_calls.strip():
+            try:
+                tool_calls = json.loads(tool_calls)
+            except json.JSONDecodeError:
+                tool_calls = None
+        if isinstance(tool_calls, list):
+            tool_uses = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_name = tool_call.get("name") or tool_call.get("tool") or tool_call.get("function", {}).get("name")
+                tool_input = (
+                    tool_call.get("arguments")
+                    or tool_call.get("input")
+                    or tool_call.get("args")
+                    or tool_call.get("function", {}).get("arguments")
+                    or {}
+                )
+                if isinstance(tool_input, str):
+                    try:
+                        tool_input = json.loads(tool_input)
+                    except json.JSONDecodeError:
+                        tool_input = {"raw": tool_input}
+                tu: dict[str, Any] = {
+                    "tool": tool_name,
+                    "input": _parse_tool_input(tool_name, tool_input, anonymizer),
+                }
+                tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    tu["id"] = tool_call_id
+                tool_uses.append(tu)
+            if tool_uses:
+                msg["tool_uses"] = tool_uses
+        if len(msg) == 2 and "content" not in msg:
+            return None
+        return msg
+
+    if role == "tool":
+        tool_name = row["tool_name"]
+        msg: dict[str, Any] = {"role": "assistant", "timestamp": timestamp}
+        msg["tool_uses"] = [{
+            "tool": tool_name,
+            "status": "success",
+            "output": {"text": text_content or ""},
+        }]
+        tool_call_id = row["tool_call_id"]
+        if isinstance(tool_call_id, str) and tool_call_id:
+            msg["tool_uses"][0]["id"] = tool_call_id
+        return msg
+
+    return None
+
+
+def _parse_hermes_project_sessions(
+    source_name: str,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> list[dict]:
+    if not HERMES_DB_PATH.exists():
+        return []
+
+    sessions = []
+    try:
+        with sqlite3.connect(HERMES_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            session_rows = conn.execute(
+                """
+                SELECT id, source, model, started_at, ended_at, tool_call_count, input_tokens, output_tokens
+                FROM sessions
+                WHERE COALESCE(NULLIF(source, ''), 'unknown') = ?
+                ORDER BY started_at ASC, id ASC
+                """,
+                (source_name,),
+            ).fetchall()
+
+            for session_row in session_rows:
+                message_rows = conn.execute(
+                    """
+                    SELECT role, content, tool_call_id, tool_calls, tool_name, timestamp, reasoning
+                    FROM messages
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (session_row["id"],),
+                ).fetchall()
+
+                messages: list[dict[str, Any]] = []
+                stats = _make_stats()
+                for message_row in message_rows:
+                    parsed = _parse_hermes_message(message_row, anonymizer, include_thinking)
+                    if not parsed:
+                        continue
+                    messages.append(parsed)
+                    if parsed["role"] == "user":
+                        stats["user_messages"] += 1
+                    elif parsed["role"] == "assistant":
+                        stats["assistant_messages"] += 1
+                        stats["tool_uses"] += len(parsed.get("tool_uses", []))
+
+                stats["tool_uses"] = max(stats["tool_uses"], _safe_int(session_row["tool_call_count"]))
+                stats["input_tokens"] = _safe_int(session_row["input_tokens"])
+                stats["output_tokens"] = _safe_int(session_row["output_tokens"])
+
+                metadata = {
+                    "session_id": session_row["id"],
+                    "model": session_row["model"] or "hermes-unknown",
+                    "git_branch": None,
+                    "start_time": _normalize_unix_timestamp(session_row["started_at"]),
+                    "end_time": _normalize_unix_timestamp(session_row["ended_at"]),
+                }
+                result = _make_session_result(metadata, messages, stats)
+                if result:
+                    result["project"] = _build_hermes_project_name(source_name)
+                    result["source"] = HERMES_SOURCE
+                    sessions.append(result)
+    except (sqlite3.Error, OSError):
+        return []
+
+    return sessions
 
 
 def _parse_custom_sessions(
@@ -451,6 +639,9 @@ def parse_project_sessions(
                     parsed["model"] = "kimi-k2"
                 sessions.append(parsed)
         return sessions
+
+    if source == HERMES_SOURCE:
+        return _parse_hermes_project_sessions(project_dir_name, anonymizer, include_thinking)
 
     if source == OPENCLAW_SOURCE:
         index = _get_openclaw_project_index()
@@ -2029,6 +2220,18 @@ def _normalize_timestamp(value) -> str | None:
         return value
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+    return None
+
+
+def _normalize_unix_timestamp(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        if value > 10_000_000_000:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
     return None
 
 
