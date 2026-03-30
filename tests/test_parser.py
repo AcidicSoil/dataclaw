@@ -21,6 +21,8 @@ from dataclaw.parser import (
     parse_project_sessions,
     _parse_codex_session_file,
     _parse_openclaw_session_file,
+    _parse_pi_session_file,
+    _build_pi_project_name,
 )
 
 
@@ -1935,3 +1937,179 @@ class TestDiscoverCustomProjects:
         monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", custom_dir)
         sessions = parse_project_sessions("nope", mock_anonymizer, source="custom")
         assert sessions == []
+
+
+# --- Pi session parsing ---
+
+
+def _make_pi_session_header(session_id="pi-sess-1", cwd="/Users/alice/projects/pi-app", git_branch=None):
+    header = {
+        "type": "session",
+        "id": session_id,
+        "cwd": cwd,
+        "timestamp": "2026-03-01T10:00:00.000Z",
+    }
+    if git_branch:
+        header["gitBranch"] = git_branch
+    return header
+
+
+def _make_pi_message(
+    entry_id,
+    role,
+    blocks,
+    timestamp,
+    parent_id=None,
+    model=None,
+    provider=None,
+    usage=None,
+):
+    entry = {
+        "type": "message",
+        "id": entry_id,
+        "timestamp": timestamp,
+        "message": {"role": role, "content": blocks},
+    }
+    if parent_id:
+        entry["parentId"] = parent_id
+    if model is not None:
+        entry["message"]["model"] = model
+    if provider is not None:
+        entry["message"]["provider"] = provider
+    if usage is not None:
+        entry["message"]["usage"] = usage
+    return entry
+
+
+class TestPiParser:
+    def test_build_project_name(self):
+        assert _build_pi_project_name("my-repo") == "pi:my-repo"
+
+    def test_linear_parse_with_fallback_model_and_malformed_line(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "pi-linear.jsonl"
+        lines = [
+            json.dumps(_make_pi_session_header()),
+            json.dumps(_make_pi_message(
+                "u1", "user", [{"type": "text", "text": "Hello pi"}], "2026-03-01T10:01:00.000Z"
+            )),
+            "{malformed json",
+            json.dumps(_make_pi_message(
+                "a1",
+                "assistant",
+                [{"type": "thinking", "thinking": "reasoning"}, {"type": "text", "text": "Hi there"}],
+                "2026-03-01T10:02:00.000Z",
+                parent_id="u1",
+                usage={"input": 12, "output": 5},
+            )),
+        ]
+        session_file.write_text("\n".join(lines) + "\n")
+
+        result = _parse_pi_session_file(session_file, mock_anonymizer, include_thinking=False)
+        assert result is not None
+        assert result["session_id"] == "pi-sess-1"
+        assert result["model"] == "pi-unknown"
+        assert result["git_branch"] is None
+        assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
+        assert result["messages"][1]["content"] == "Hi there"
+        assert "thinking" not in result["messages"][1]
+        assert result["stats"]["input_tokens"] == 12
+        assert result["stats"]["output_tokens"] == 5
+
+    def test_model_change_and_tool_result_attachment(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "pi-tool.jsonl"
+        lines = [
+            _make_pi_session_header(git_branch="main"),
+            {"type": "model_change", "timestamp": "2026-03-01T10:00:30.000Z", "provider": "anthropic", "modelId": "claude-sonnet-4"},
+            _make_pi_message(
+                "u1", "user", [{"type": "text", "text": "Read file"}], "2026-03-01T10:01:00.000Z"
+            ),
+            _make_pi_message(
+                "a1",
+                "assistant",
+                [
+                    {"type": "text", "text": "Checking"},
+                    {"type": "toolCall", "id": "tc-1", "name": "read_file", "arguments": {"path": "/tmp/a.py"}},
+                    {"type": "toolResult", "toolCallId": "tc-1", "text": "print('hi')"},
+                ],
+                "2026-03-01T10:02:00.000Z",
+                parent_id="u1",
+                usage={"input": 20, "output": 7, "cacheRead": 3},
+            ),
+        ]
+        session_file.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+
+        result = _parse_pi_session_file(session_file, mock_anonymizer)
+        assert result is not None
+        assert result["model"] == "anthropic/claude-sonnet-4"
+        assert result["git_branch"] == "main"
+        assistant = result["messages"][1]
+        assert assistant["tool_uses"][0]["tool"] == "read_file"
+        assert assistant["tool_uses"][0]["status"] == "success"
+        assert "hi" in assistant["tool_uses"][0]["output"]["text"]
+        assert result["stats"]["tool_uses"] == 1
+        assert result["stats"]["input_tokens"] == 23
+        assert result["stats"]["output_tokens"] == 7
+
+    def test_active_leaf_and_summary_events(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "pi-branch.jsonl"
+        lines = [
+            _make_pi_session_header(),
+            _make_pi_message("u1", "user", [{"type": "text", "text": "start"}], "2026-03-01T10:01:00.000Z"),
+            _make_pi_message("a-keep", "assistant", [{"type": "text", "text": "keep me"}], "2026-03-01T10:02:00.000Z", parent_id="u1"),
+            _make_pi_message("a-drop", "assistant", [{"type": "text", "text": "drop me"}], "2026-03-01T10:02:30.000Z", parent_id="u1"),
+            {"type": "compaction", "id": "c1", "parentId": "a-keep", "timestamp": "2026-03-01T10:03:00.000Z", "summary": "compacted context"},
+            {"type": "branch_summary", "id": "s1", "parentId": "c1", "timestamp": "2026-03-01T10:03:30.000Z", "summary": "branch recap"},
+        ]
+        session_file.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+
+        result = _parse_pi_session_file(session_file, mock_anonymizer)
+        assert result is not None
+        contents = [m.get("content") for m in result["messages"]]
+        assert "keep me" in contents
+        assert "drop me" not in contents
+        assert "compacted context" in contents
+        assert "branch recap" in contents
+
+
+class TestDiscoverPiProjects:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("dataclaw.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("dataclaw.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("dataclaw.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("dataclaw.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("dataclaw.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("dataclaw.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("dataclaw.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("dataclaw.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi")
+        monkeypatch.setattr("dataclaw.parser.HERMES_DB_PATH", tmp_path / "no-hermes.db")
+        monkeypatch.setattr("dataclaw.parser.CUSTOM_DIR", tmp_path / "no-custom")
+        monkeypatch.setattr("dataclaw.parser.PI_SESSIONS_DIR", tmp_path / "pi-sessions")
+
+    def test_discover_and_parse_project_sessions(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        project_dir = tmp_path / "pi-sessions" / "repo-one"
+        project_dir.mkdir(parents=True)
+        for sid in ["one", "two"]:
+            (project_dir / f"{sid}.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(_make_pi_session_header(session_id=sid)),
+                        json.dumps(_make_pi_message("u1", "user", [{"type": "text", "text": sid}], "2026-03-01T10:01:00.000Z")),
+                        json.dumps(_make_pi_message("a1", "assistant", [{"type": "text", "text": f"reply-{sid}"}], "2026-03-01T10:02:00.000Z", parent_id="u1", model="pi-fast")),
+                    ]
+                )
+                + "\n"
+            )
+
+        projects = discover_projects()
+        assert len(projects) == 1
+        assert projects[0]["source"] == "pi"
+        assert projects[0]["display_name"] == "pi:repo-one"
+        assert projects[0]["session_count"] == 2
+
+        sessions = parse_project_sessions("repo-one", mock_anonymizer, source="pi")
+        assert len(sessions) == 2
+        assert all(session["source"] == "pi" for session in sessions)
+        assert all(session["project"] == "pi:repo-one" for session in sessions)

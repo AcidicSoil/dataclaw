@@ -23,6 +23,7 @@ from dataclaw.cli import (
     export_to_jsonl,
     list_projects,
     main,
+    _source_label,
     push_to_huggingface,
 )
 
@@ -400,7 +401,7 @@ class TestListProjects:
         monkeypatch.setattr("dataclaw.cli.discover_projects", lambda: [])
         list_projects()
         captured = capsys.readouterr()
-        assert "No Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, Hermes, or Custom sessions" in captured.out
+        assert "No Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Pi, Kimi CLI, Hermes, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(
@@ -626,7 +627,7 @@ class TestWorkflowGateMessages:
         assert payload["error"] == "Source scope is not confirmed yet."
         assert payload["blocked_on_step"] == "Step 2/6"
         assert len(payload["process_steps"]) == 6
-        assert payload["allowed_sources"] == ["all", "both", "claude", "codex", "custom", "gemini", "hermes", "kimi", "openclaw", "opencode"]
+        assert payload["allowed_sources"] == ["all", "both", "claude", "codex", "custom", "gemini", "hermes", "kimi", "openclaw", "opencode", "pi"]
         assert payload["next_command"] == "dataclaw config --source all"
 
     def test_configure_next_steps_require_full_folder_presentation(self):
@@ -785,3 +786,49 @@ class TestScanPiiHighEntropy:
         f.write_text('{"message": "nothing suspicious here at all"}\n')
         results = _scan_pii(f)
         assert "high_entropy_strings" not in results
+
+
+class TestPiCliSupport:
+    def test_source_label_includes_pi(self):
+        assert _source_label("pi") == "Pi"
+
+    def test_list_projects_pi_source_filter(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "dataclaw.cli.discover_projects",
+            lambda: [
+                {
+                    "display_name": "pi:repo-one",
+                    "session_count": 2,
+                    "total_size_bytes": 512,
+                    "source": "pi",
+                }
+            ],
+        )
+        monkeypatch.setattr("dataclaw.cli.load_config", lambda: {"excluded_projects": []})
+
+        list_projects(source_filter="pi")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload[0]["source"] == "pi"
+        assert payload[0]["name"] == "pi:repo-one"
+
+    def test_main_accepts_source_pi(self, monkeypatch):
+        called = {}
+        monkeypatch.setattr("dataclaw.cli.prep", lambda source_filter="auto": called.setdefault("source", source_filter))
+        monkeypatch.setattr("sys.argv", ["dataclaw", "prep", "--source", "pi"])
+        main()
+        assert called["source"] == "pi"
+
+    def test_export_gate_lists_pi_as_allowed_source(self, monkeypatch, capsys):
+        monkeypatch.setattr("dataclaw.cli.load_config", lambda: {})
+        monkeypatch.setattr("sys.argv", ["dataclaw", "export"])
+        with pytest.raises(SystemExit):
+            main()
+        payload = json.loads(capsys.readouterr().out)
+        assert "pi" in payload["allowed_sources"]
+        assert "pi" in payload["required_action"]
+
+    def test_no_projects_message_uses_pi_label(self, monkeypatch, capsys):
+        monkeypatch.setattr("dataclaw.cli.discover_projects", lambda: [])
+        monkeypatch.setattr("dataclaw.cli.load_config", lambda: {"excluded_projects": []})
+        list_projects(source_filter="pi")
+        assert "No Pi sessions found." in capsys.readouterr().out

@@ -1,4 +1,4 @@
-"""Parse Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw session data into conversations."""
+"""Parse Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, and Pi session data into conversations."""
 
 import dataclasses
 import hashlib
@@ -22,6 +22,7 @@ OPENCLAW_SOURCE = "openclaw"
 KIMI_SOURCE = "kimi"
 HERMES_SOURCE = "hermes"
 CUSTOM_SOURCE = "custom"
+PI_SOURCE = "pi"
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -50,6 +51,8 @@ HERMES_DIR = Path.home() / ".hermes"
 HERMES_DB_PATH = HERMES_DIR / "state.db"
 
 CUSTOM_DIR = Path.home() / ".dataclaw" / "custom"
+PI_DIR = Path.home() / ".pi"
+PI_SESSIONS_DIR = PI_DIR / "agent" / "sessions"
 
 _CODEX_PROJECT_INDEX: dict[str, list[Path]] = {}
 _GEMINI_HASH_MAP: dict[str, str] = {}
@@ -146,6 +149,7 @@ def discover_projects() -> list[dict]:
     projects.extend(_discover_kimi_projects())
     projects.extend(_discover_hermes_projects())
     projects.extend(_discover_custom_projects())
+    projects.extend(_discover_pi_projects())
     return sorted(projects, key=lambda p: (p["display_name"], p["source"]))
 
 
@@ -409,6 +413,29 @@ def _discover_custom_projects() -> list[dict]:
     return projects
 
 
+def _discover_pi_projects() -> list[dict]:
+    if not PI_SESSIONS_DIR.exists():
+        return []
+
+    projects = []
+    for project_dir in sorted(PI_SESSIONS_DIR.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        session_files = [f for f in sorted(project_dir.glob("*.jsonl")) if f.is_file()]
+        if not session_files:
+            continue
+        projects.append(
+            {
+                "dir_name": project_dir.name,
+                "display_name": _build_pi_project_name(project_dir.name),
+                "session_count": len(session_files),
+                "total_size_bytes": sum(f.stat().st_size for f in session_files),
+                "source": PI_SOURCE,
+            }
+        )
+    return projects
+
+
 def _parse_hermes_message(
     row: sqlite3.Row,
     anonymizer: Anonymizer,
@@ -642,6 +669,19 @@ def parse_project_sessions(
 
     if source == HERMES_SOURCE:
         return _parse_hermes_project_sessions(project_dir_name, anonymizer, include_thinking)
+
+    if source == PI_SOURCE:
+        project_path = PI_SESSIONS_DIR / project_dir_name
+        if not project_path.exists():
+            return []
+        sessions = []
+        for session_file in sorted(project_path.glob("*.jsonl")):
+            parsed = _parse_pi_session_file(session_file, anonymizer, include_thinking)
+            if parsed and parsed["messages"]:
+                parsed["project"] = _build_pi_project_name(project_dir_name)
+                parsed["source"] = PI_SOURCE
+                sessions.append(parsed)
+        return sessions
 
     if source == OPENCLAW_SOURCE:
         index = _get_openclaw_project_index()
@@ -1377,6 +1417,333 @@ def _parse_openclaw_session_file(
     return _make_session_result(metadata, messages, stats)
 
 
+def _build_pi_entry_tree(entries: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
+    nodes: dict[str, dict[str, Any]] = {}
+    children: dict[str, list[str]] = {}
+    for entry in entries:
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id:
+            continue
+        nodes[entry_id] = entry
+        parent_id = entry.get("parentId")
+        if isinstance(parent_id, str) and parent_id:
+            children.setdefault(parent_id, []).append(entry_id)
+        children.setdefault(entry_id, [])
+    return nodes, children
+
+
+def _build_pi_leaf_path(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    nodes, children = _build_pi_entry_tree(entries)
+    if not nodes:
+        return entries
+
+    ordered_ids = [entry.get("id") for entry in entries if isinstance(entry.get("id"), str)]
+    leaf_id = None
+    for entry_id in reversed(ordered_ids):
+        if not children.get(entry_id):
+            leaf_id = entry_id
+            break
+    if leaf_id is None:
+        return entries
+
+    path_ids: list[str] = []
+    seen: set[str] = set()
+    current_id: str | None = leaf_id
+    while current_id and current_id not in seen and current_id in nodes:
+        seen.add(current_id)
+        path_ids.append(current_id)
+        parent_id = nodes[current_id].get("parentId")
+        current_id = parent_id if isinstance(parent_id, str) and parent_id else None
+
+    active_path = set(path_ids)
+    filtered_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id:
+            filtered_entries.append(entry)
+            continue
+
+        lineage_ids: set[str] = set()
+        current_lineage_id: str | None = entry_id
+        while current_lineage_id and current_lineage_id not in lineage_ids and current_lineage_id in nodes:
+            lineage_ids.add(current_lineage_id)
+            parent_id = nodes[current_lineage_id].get("parentId")
+            current_lineage_id = parent_id if isinstance(parent_id, str) and parent_id else None
+
+        if lineage_ids and lineage_ids.issubset(active_path):
+            filtered_entries.append(entry)
+    return filtered_entries
+
+
+def _flatten_pi_content_blocks(
+    content: Any,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> tuple[list[str], list[str], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    tool_uses: list[dict[str, Any]] = []
+    tool_results: list[tuple[str, dict[str, Any]]] = []
+
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        if isinstance(block, str):
+            if block.strip():
+                text_parts.append(anonymizer.text(block.strip()))
+            continue
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text", "")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(anonymizer.text(text.strip()))
+        elif block_type == "thinking" and include_thinking:
+            thinking = block.get("thinking") or block.get("text") or ""
+            if isinstance(thinking, str) and thinking.strip():
+                thinking_parts.append(anonymizer.text(thinking.strip()))
+        elif block_type == "toolCall":
+            tool_name = block.get("name")
+            arguments = block.get("arguments") or block.get("input") or {}
+            tool_entry: dict[str, Any] = {
+                "tool": tool_name,
+                "input": _parse_tool_input(tool_name, arguments, anonymizer),
+            }
+            tool_uses.append(tool_entry)
+            tool_call_id = block.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                tool_results.append((tool_call_id, tool_entry))
+        elif block_type == "toolResult":
+            tool_call_id = block.get("toolCallId") or block.get("id")
+            output_text = block.get("text") or block.get("output") or ""
+            if isinstance(output_text, list):
+                output_text = "\n".join(
+                    part.get("text", "") for part in output_text if isinstance(part, dict)
+                )
+            output: dict[str, Any] = {}
+            if isinstance(output_text, str) and output_text.strip():
+                output["text"] = anonymizer.text(output_text.strip())
+            tool_results.append(
+                (
+                    tool_call_id,
+                    {
+                        "output": output,
+                        "status": "error" if block.get("isError") else "success",
+                    },
+                )
+            )
+
+    return text_parts, thinking_parts, tool_uses, tool_results
+
+
+def _collect_pi_tool_results(
+    entry: dict[str, Any],
+    anonymizer: Anonymizer,
+) -> dict[str, dict[str, Any]]:
+    tool_result_map: dict[str, dict[str, Any]] = {}
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return tool_result_map
+
+    content = message.get("content")
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "toolResult":
+            continue
+        tool_call_id = block.get("toolCallId") or block.get("id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            continue
+        output_text = block.get("text") or block.get("output") or ""
+        if isinstance(output_text, list):
+            output_text = "\n".join(
+                part.get("text", "") for part in output_text if isinstance(part, dict)
+            )
+        output: dict[str, Any] = {}
+        if isinstance(output_text, str) and output_text.strip():
+            output["text"] = anonymizer.text(output_text.strip())
+        tool_result_map[tool_call_id] = {
+            "output": output,
+            "status": "error" if block.get("isError") else "success",
+        }
+    return tool_result_map
+
+
+def _parse_pi_session_file(
+    filepath: Path, anonymizer: Anonymizer, include_thinking: bool = True
+) -> dict[str, Any] | None:
+    try:
+        entries = list(_iter_jsonl(filepath))
+    except OSError:
+        return None
+
+    if not entries:
+        return None
+
+    header = entries[0]
+    if header.get("type") != "session":
+        return None
+
+    metadata: dict[str, Any] = {
+        "session_id": header.get("id") or header.get("sessionId") or filepath.stem,
+        "cwd": anonymizer.path(header["cwd"]) if isinstance(header.get("cwd"), str) and header.get("cwd") else None,
+        "git_branch": header.get("gitBranch") if isinstance(header.get("gitBranch"), str) and header.get("gitBranch") else None,
+        "model": None,
+        "start_time": header.get("timestamp") or _normalize_timestamp(header.get("createdAt")),
+        "end_time": None,
+    }
+    messages: list[dict[str, Any]] = []
+    stats = _make_stats()
+
+    active_entries = _build_pi_leaf_path(entries[1:])
+    tool_result_map: dict[str, dict[str, Any]] = {}
+    for entry in active_entries:
+        if entry.get("type") == "message":
+            tool_result_map.update(_collect_pi_tool_results(entry, anonymizer))
+
+    final_model = None
+    for entry in active_entries:
+        entry_type = entry.get("type")
+        timestamp = entry.get("timestamp") or _normalize_timestamp(entry.get("createdAt"))
+
+        if not metadata["git_branch"] and isinstance(entry.get("gitBranch"), str) and entry.get("gitBranch"):
+            metadata["git_branch"] = entry.get("gitBranch")
+
+        if entry_type == "model_change":
+            provider = entry.get("provider", "")
+            model_id = entry.get("modelId") or entry.get("model") or ""
+            if model_id:
+                final_model = f"{provider}/{model_id}" if provider else model_id
+                metadata["model"] = final_model
+            _update_time_bounds(metadata, timestamp)
+            continue
+
+        if entry_type in {"compaction", "branch_summary"}:
+            summary_text = entry.get("summary") or entry.get("content") or entry.get("text") or ""
+            if isinstance(summary_text, list):
+                summary_text = "\n".join(
+                    part.get("text", "") for part in summary_text if isinstance(part, dict)
+                )
+            if isinstance(summary_text, str) and summary_text.strip():
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": anonymizer.text(summary_text.strip()),
+                        "timestamp": timestamp,
+                    }
+                )
+                stats["assistant_messages"] += 1
+                _update_time_bounds(metadata, timestamp)
+            continue
+
+        if entry_type in {"custom", "custom_message"}:
+            custom_text = entry.get("content") or entry.get("text") or entry.get("summary") or ""
+            if isinstance(custom_text, str) and custom_text.strip():
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": anonymizer.text(custom_text.strip()),
+                        "timestamp": timestamp,
+                    }
+                )
+                stats["assistant_messages"] += 1
+                _update_time_bounds(metadata, timestamp)
+            continue
+
+        if entry_type == "bashExecution":
+            command = entry.get("command") or ""
+            output = entry.get("output") or ""
+            exit_code = entry.get("exitCode")
+            tool_use: dict[str, Any] = {"tool": "bash", "input": {}}
+            if isinstance(command, str) and command.strip():
+                tool_use["input"] = {"command": anonymizer.text(command.strip())}
+            if isinstance(output, str) and output.strip():
+                tool_use["output"] = {"text": anonymizer.text(output.strip())}
+            if exit_code is not None:
+                tool_use.setdefault("output", {})["exit_code"] = exit_code
+                tool_use["status"] = "error" if exit_code else "success"
+            messages.append({"role": "assistant", "tool_uses": [tool_use], "timestamp": timestamp})
+            stats["assistant_messages"] += 1
+            stats["tool_uses"] += 1
+            _update_time_bounds(metadata, timestamp)
+            continue
+
+        if entry_type != "message":
+            continue
+
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "user":
+            text_parts, _thinking_parts, _tool_uses, _tool_results = _flatten_pi_content_blocks(
+                content, anonymizer, include_thinking=False,
+            )
+            if text_parts:
+                messages.append({
+                    "role": "user",
+                    "content": "\n\n".join(text_parts),
+                    "timestamp": timestamp,
+                })
+                stats["user_messages"] += 1
+                _update_time_bounds(metadata, timestamp)
+            continue
+
+        if role != "assistant":
+            continue
+
+        model = message.get("model")
+        provider = message.get("provider")
+        if model:
+            final_model = f"{provider}/{model}" if provider else model
+            metadata["model"] = final_model
+
+        usage = message.get("usage", {})
+        if isinstance(usage, dict):
+            stats["input_tokens"] += _safe_int(usage.get("input")) + _safe_int(usage.get("cacheRead")) + _safe_int(usage.get("input_tokens")) + _safe_int(usage.get("cache_read_input_tokens"))
+            stats["output_tokens"] += _safe_int(usage.get("output")) + _safe_int(usage.get("output_tokens"))
+
+        text_parts, thinking_parts, tool_uses, inline_tool_results = _flatten_pi_content_blocks(
+            content, anonymizer, include_thinking,
+        )
+        for tool_call_id, payload in inline_tool_results:
+            if isinstance(tool_call_id, str) and tool_call_id and payload.get("output") is not None:
+                tool_result_map[tool_call_id] = payload
+
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            tool_call_id = block.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id in tool_result_map:
+                result = tool_result_map[tool_call_id]
+                if result.get("output"):
+                    tool_uses[[b.get("id") for b in content if isinstance(b, dict) and b.get("type") == "toolCall"].index(tool_call_id)]["output"] = result["output"]
+                if result.get("status"):
+                    tool_uses[[b.get("id") for b in content if isinstance(b, dict) and b.get("type") == "toolCall"].index(tool_call_id)]["status"] = result["status"]
+
+        if not text_parts and not thinking_parts and not tool_uses:
+            continue
+
+        assistant_message: dict[str, Any] = {"role": "assistant", "timestamp": timestamp}
+        if text_parts:
+            assistant_message["content"] = "\n\n".join(text_parts)
+        if thinking_parts:
+            assistant_message["thinking"] = "\n\n".join(thinking_parts)
+        if tool_uses:
+            assistant_message["tool_uses"] = tool_uses
+            stats["tool_uses"] += len(tool_uses)
+        messages.append(assistant_message)
+        stats["assistant_messages"] += 1
+        _update_time_bounds(metadata, timestamp)
+
+    if metadata["model"] is None:
+        metadata["model"] = final_model or "pi-unknown"
+
+    return _make_session_result(metadata, messages, stats)
+
+
 @dataclasses.dataclass
 class _CodexParseState:
     messages: list[dict[str, Any]] = dataclasses.field(default_factory=list)
@@ -1881,6 +2248,10 @@ def _build_openclaw_project_name(cwd: str) -> str:
     if cwd == UNKNOWN_OPENCLAW_CWD:
         return "openclaw:unknown"
     return f"openclaw:{Path(cwd).name or cwd}"
+
+
+def _build_pi_project_name(project_dir_name: str) -> str:
+    return f"pi:{Path(project_dir_name).name or project_dir_name}"
 
 
 def _get_opencode_project_index(refresh: bool = False) -> dict[str, list[str]]:
